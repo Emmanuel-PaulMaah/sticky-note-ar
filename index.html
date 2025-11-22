@@ -78,19 +78,17 @@
 
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
 
     const statusEl = document.getElementById('status');
     const noteInput = document.getElementById('noteText');
     const startButton = document.getElementById('startButton');
 
     let currentNoteText = '';
-
     noteInput.addEventListener('input', () => {
       currentNoteText = noteInput.value.trim();
     });
 
-    // three.js + webxr setup
+    // three.js + renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -108,13 +106,16 @@
     const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
     scene.add(light);
 
-    // reticle to show placement point
+    // reticle
     const reticleGeometry = new THREE.RingGeometry(0.06, 0.07, 32).rotateX(-Math.PI / 2);
     const reticleMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
     const reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
     reticle.matrixAutoUpdate = false;
-    reticle.visible = false;
+    reticle.visible = false; // will be turned on when session starts
     scene.add(reticle);
+
+    // last known valid "wall" pose for reticle
+    let lastReticleMatrix = null;
 
     // webxr hit-test state
     let hitTestSource = null;
@@ -125,7 +126,7 @@
       statusEl.textContent = msg;
     }
 
-    // helper: create a sticky note as a 3d plane with text texture
+    // create sticky note mesh
     function createNoteMesh(text) {
       const canvas = document.createElement('canvas');
       canvas.width = 512;
@@ -133,10 +134,10 @@
       const ctx = canvas.getContext('2d');
 
       // background
-      ctx.fillStyle = '#facc15'; // sticky note yellow
+      ctx.fillStyle = '#facc15';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      // subtle border
+      // border
       ctx.strokeStyle = '#00000033';
       ctx.lineWidth = 8;
       ctx.strokeRect(0, 0, canvas.width, canvas.height);
@@ -176,11 +177,11 @@
         side: THREE.DoubleSide
       });
 
-      // physical size ~ 20cm x 10cm
+      // ~25cm wide note
       const physicalWidth = 0.25;
       const physicalHeight = physicalWidth * (canvas.height / canvas.width);
-
       const geometry = new THREE.PlaneGeometry(physicalWidth, physicalHeight);
+
       const mesh = new THREE.Mesh(geometry, material);
       return mesh;
     }
@@ -192,54 +193,72 @@
           setStatus('immersive-ar not supported on this device/browser');
           startButton.disabled = true;
         } else {
-          setStatus('ready: point at a wall & tap in ar to place a note');
+          setStatus('ready: start ar, point at a wall, tap to place notes');
         }
+      }).catch((err) => {
+        console.error(err);
+        setStatus('error checking webxr: ' + err.message);
+        startButton.disabled = true;
       });
     } else {
       setStatus('webxr not available');
       startButton.disabled = true;
     }
 
-    // create controller for tap/select events
+    // controller: tap to place note
     const controller = renderer.xr.getController(0);
     controller.addEventListener('select', () => {
-      if (!reticle.visible) return;
+      if (!reticle.visible || !lastReticleMatrix) return;
+
       const text = currentNoteText || 'sticky note';
       const note = createNoteMesh(text);
-      note.matrix.copy(reticle.matrix);
+
+      note.matrix.copy(lastReticleMatrix);
       note.matrix.decompose(note.position, note.quaternion, note.scale);
+
       scene.add(note);
     });
     scene.add(controller);
 
     function onSessionStart(session) {
       session.addEventListener('end', onSessionEnd);
-      setStatus('ar session started: point at a wall & tap to place note');
+
+      hitTestSource = null;
+      hitTestSourceRequested = false;
+      localSpace = null;
+      lastReticleMatrix = null;
+
+      reticle.visible = true; // visible from the beginning of the session
+      setStatus('ar started: point at a wall & tap to place notes');
     }
 
     function onSessionEnd() {
       hitTestSourceRequested = false;
       hitTestSource = null;
       localSpace = null;
+      lastReticleMatrix = null;
       reticle.visible = false;
       setStatus('ar session ended');
     }
 
     startButton.addEventListener('click', () => {
+      if (!navigator.xr) return;
+
       const sessionInit = {
         requiredFeatures: ['hit-test', 'local-floor'],
         optionalFeatures: ['dom-overlay'],
         domOverlay: { root: document.body }
       };
 
-      ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }); // no DOM insert
-      navigator.xr.requestSession('immersive-ar', sessionInit).then((session) => {
-        renderer.xr.setSession(session);
-        onSessionStart(session);
-      }).catch((err) => {
-        console.error(err);
-        setStatus('failed to start ar: ' + err.message);
-      });
+      navigator.xr.requestSession('immersive-ar', sessionInit)
+        .then((session) => {
+          renderer.xr.setSession(session);
+          onSessionStart(session);
+        })
+        .catch((err) => {
+          console.error(err);
+          setStatus('failed to start ar: ' + err.message);
+        });
     });
 
     function animate() {
@@ -248,19 +267,26 @@
 
     function render(timestamp, frame) {
       const session = renderer.xr.getSession();
-      if (session && frame) {
-        const referenceSpace = renderer.xr.getReferenceSpace();
 
+      if (session && frame) {
+        // request hit-test source once
         if (!hitTestSourceRequested) {
-          const xrSession = renderer.xr.getSession();
-          xrSession.requestReferenceSpace('viewer').then((viewerSpace) => {
+          session.requestReferenceSpace('viewer').then((viewerSpace) => {
             session.requestHitTestSource({ space: viewerSpace }).then((source) => {
               hitTestSource = source;
+            }).catch((err) => {
+              console.error(err);
             });
+          }).catch((err) => {
+            console.error(err);
           });
-          xrSession.requestReferenceSpace('local').then((space) => {
+
+          session.requestReferenceSpace('local').then((space) => {
             localSpace = space;
+          }).catch((err) => {
+            console.error(err);
           });
+
           hitTestSourceRequested = true;
         }
 
@@ -272,30 +298,42 @@
             const pose = hit.getPose(localSpace);
 
             if (pose) {
+              // approximate "walls only" by camera orientation
               const xrCamera = renderer.xr.getCamera(camera);
-
-              // approximate "walls only":
-              // if camera is looking mostly horizontally (not steeply down/up),
-              // we consider hits valid. check camera forward vector.
-              const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-                xrCamera.quaternion
-              );
+              const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(xrCamera.quaternion);
               const verticalComponent = Math.abs(forward.y);
-
-              const lookingMostlyHorizontal = verticalComponent < 0.4; // tune if needed
+              const lookingMostlyHorizontal = verticalComponent < 0.4;
 
               if (lookingMostlyHorizontal) {
-                reticle.visible = true;
-                reticle.matrix.fromArray(pose.transform.matrix);
-              } else {
-                reticle.visible = false;
+                if (!lastReticleMatrix) {
+                  lastReticleMatrix = new THREE.Matrix4();
+                }
+                lastReticleMatrix.fromArray(pose.transform.matrix);
               }
-            } else {
-              reticle.visible = false;
             }
-          } else {
-            reticle.visible = false;
           }
+
+          // ensure reticle has some pose
+          if (!lastReticleMatrix) {
+            // no wall hit yet: place reticle 1m in front of camera
+            const xrCamera = renderer.xr.getCamera(camera);
+            const camPos = new THREE.Vector3();
+            const camQuat = new THREE.Quaternion();
+            const camScale = new THREE.Vector3();
+            xrCamera.matrixWorld.decompose(camPos, camQuat, camScale);
+
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat).normalize();
+            const pos = camPos.clone().add(forward.multiplyScalar(1.0)); // 1m ahead
+
+            const scale = new THREE.Vector3(1, 1, 1);
+            const m = new THREE.Matrix4().compose(pos, camQuat, scale);
+
+            reticle.matrix.copy(m);
+          } else {
+            reticle.matrix.copy(lastReticleMatrix);
+          }
+
+          reticle.visible = true;
         }
       }
 
