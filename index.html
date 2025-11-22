@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>filehands ar sticky notes</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #000;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    /* ui overlay */
+    #ui {
+      position: fixed;
+      top: env(safe-area-inset-top, 8px);
+      left: env(safe-area-inset-left, 8px);
+      right: env(safe-area-inset-right, 8px);
+      padding: 8px 10px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      background: rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(10px);
+      z-index: 10;
+    }
+    #noteText {
+      flex: 1;
+      padding: 6px 8px;
+      font-size: 14px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+    }
+    #noteText::placeholder {
+      color: rgba(255,255,255,0.5);
+    }
+    #startButton {
+      padding: 6px 10px;
+      font-size: 14px;
+      border-radius: 999px;
+      border: none;
+      background: #22c55e;
+      color: #000;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #status {
+      position: fixed;
+      bottom: env(safe-area-inset-bottom, 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 4px 8px;
+      font-size: 12px;
+      background: rgba(0,0,0,0.6);
+      border-radius: 999px;
+      z-index: 10;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <input id="noteText" type="text" placeholder="type a sticky note…" />
+    <button id="startButton">start ar</button>
+  </div>
+  <div id="status">checking webxr…</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+    const statusEl = document.getElementById('status');
+    const noteInput = document.getElementById('noteText');
+    const startButton = document.getElementById('startButton');
+
+    let currentNoteText = '';
+
+    noteInput.addEventListener('input', () => {
+      currentNoteText = noteInput.value.trim();
+    });
+
+    // three.js + webxr setup
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(
+      70,
+      window.innerWidth / window.innerHeight,
+      0.01,
+      20
+    );
+
+    const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    scene.add(light);
+
+    // reticle to show placement point
+    const reticleGeometry = new THREE.RingGeometry(0.06, 0.07, 32).rotateX(-Math.PI / 2);
+    const reticleMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // webxr hit-test state
+    let hitTestSource = null;
+    let hitTestSourceRequested = false;
+    let localSpace = null;
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    // helper: create a sticky note as a 3d plane with text texture
+    function createNoteMesh(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+
+      // background
+      ctx.fillStyle = '#facc15'; // sticky note yellow
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // subtle border
+      ctx.strokeStyle = '#00000033';
+      ctx.lineWidth = 8;
+      ctx.strokeRect(0, 0, canvas.width, canvas.height);
+
+      // text
+      ctx.fillStyle = '#111827';
+      ctx.font = 'bold 40px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+
+      const padding = 40;
+      const maxWidth = canvas.width - padding * 2;
+
+      const words = (text || 'empty note').split(/\s+/);
+      let line = '';
+      let y = padding;
+
+      for (let i = 0; i < words.length; i++) {
+        const testLine = line + words[i] + ' ';
+        const metrics = ctx.measureText(testLine);
+        if (metrics.width > maxWidth && i > 0) {
+          ctx.fillText(line, padding, y, maxWidth);
+          line = words[i] + ' ';
+          y += 46;
+        } else {
+          line = testLine;
+        }
+      }
+      ctx.fillText(line, padding, y, maxWidth);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        side: THREE.DoubleSide
+      });
+
+      // physical size ~ 20cm x 10cm
+      const physicalWidth = 0.25;
+      const physicalHeight = physicalWidth * (canvas.height / canvas.width);
+
+      const geometry = new THREE.PlaneGeometry(physicalWidth, physicalHeight);
+      const mesh = new THREE.Mesh(geometry, material);
+      return mesh;
+    }
+
+    // check webxr support
+    if (navigator.xr) {
+      navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+        if (!supported) {
+          setStatus('immersive-ar not supported on this device/browser');
+          startButton.disabled = true;
+        } else {
+          setStatus('ready: point at a wall & tap in ar to place a note');
+        }
+      });
+    } else {
+      setStatus('webxr not available');
+      startButton.disabled = true;
+    }
+
+    // create controller for tap/select events
+    const controller = renderer.xr.getController(0);
+    controller.addEventListener('select', () => {
+      if (!reticle.visible) return;
+      const text = currentNoteText || 'sticky note';
+      const note = createNoteMesh(text);
+      note.matrix.copy(reticle.matrix);
+      note.matrix.decompose(note.position, note.quaternion, note.scale);
+      scene.add(note);
+    });
+    scene.add(controller);
+
+    function onSessionStart(session) {
+      session.addEventListener('end', onSessionEnd);
+      setStatus('ar session started: point at a wall & tap to place note');
+    }
+
+    function onSessionEnd() {
+      hitTestSourceRequested = false;
+      hitTestSource = null;
+      localSpace = null;
+      reticle.visible = false;
+      setStatus('ar session ended');
+    }
+
+    startButton.addEventListener('click', () => {
+      const sessionInit = {
+        requiredFeatures: ['hit-test', 'local-floor'],
+        optionalFeatures: ['dom-overlay'],
+        domOverlay: { root: document.body }
+      };
+
+      ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }); // no DOM insert
+      navigator.xr.requestSession('immersive-ar', sessionInit).then((session) => {
+        renderer.xr.setSession(session);
+        onSessionStart(session);
+      }).catch((err) => {
+        console.error(err);
+        setStatus('failed to start ar: ' + err.message);
+      });
+    });
+
+    function animate() {
+      renderer.setAnimationLoop(render);
+    }
+
+    function render(timestamp, frame) {
+      const session = renderer.xr.getSession();
+      if (session && frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+
+        if (!hitTestSourceRequested) {
+          const xrSession = renderer.xr.getSession();
+          xrSession.requestReferenceSpace('viewer').then((viewerSpace) => {
+            session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+              hitTestSource = source;
+            });
+          });
+          xrSession.requestReferenceSpace('local').then((space) => {
+            localSpace = space;
+          });
+          hitTestSourceRequested = true;
+        }
+
+        if (hitTestSource && localSpace) {
+          const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+          if (hitTestResults.length > 0) {
+            const hit = hitTestResults[0];
+            const pose = hit.getPose(localSpace);
+
+            if (pose) {
+              const xrCamera = renderer.xr.getCamera(camera);
+
+              // approximate "walls only":
+              // if camera is looking mostly horizontally (not steeply down/up),
+              // we consider hits valid. check camera forward vector.
+              const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+                xrCamera.quaternion
+              );
+              const verticalComponent = Math.abs(forward.y);
+
+              const lookingMostlyHorizontal = verticalComponent < 0.4; // tune if needed
+
+              if (lookingMostlyHorizontal) {
+                reticle.visible = true;
+                reticle.matrix.fromArray(pose.transform.matrix);
+              } else {
+                reticle.visible = false;
+              }
+            } else {
+              reticle.visible = false;
+            }
+          } else {
+            reticle.visible = false;
+          }
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>
